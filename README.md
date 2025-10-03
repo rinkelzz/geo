@@ -31,8 +31,10 @@ Eine PHP/MySQL-Anwendung, um Reise-Fotos mit Geo-Informationen zu verwalten.
 
    ```bash
    mysql -u root -p -e "CREATE DATABASE geo_photothek CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-   mysql -u root -p geo_photothek < database/schema.sql
+   php install.php
    ```
+
+   Alternativ kann das Schema weiterhin manuell mit `database/schema.sql` eingespielt werden.
 
 3. `config/config.php` mit den eigenen Zugangsdaten füllen.
 
