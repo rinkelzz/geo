@@ -1,0 +1,5 @@
+/vendor/
+/public/uploads/
+/shared/
+.env
+.DS_Store
