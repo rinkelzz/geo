@@ -1,0 +1,738 @@
+document.addEventListener('DOMContentLoaded', () => {
+    const allPhotos = window.PHOTOS || [];
+    const photoIndex = new Map();
+    allPhotos.forEach(photo => {
+        const id = Number(photo.id);
+        if (Number.isFinite(id)) {
+            photoIndex.set(id, photo);
+        }
+    });
+
+    const bodyElement = document.body;
+    const appConfig = window.APP_CONFIG || {};
+    const rawHomeLatitude = Number.parseFloat(appConfig.home_latitude);
+    const rawHomeLongitude = Number.parseFloat(appConfig.home_longitude);
+    const hasLeaflet = typeof L !== 'undefined';
+    const enableHomeDistance = !bodyElement?.classList?.contains('shared-view')
+        && Number.isFinite(rawHomeLatitude)
+        && Number.isFinite(rawHomeLongitude);
+    const canDrawHomeLine = enableHomeDistance && hasLeaflet;
+
+    const sanitizeColor = (input) => {
+        if (typeof input !== 'string') {
+            return '#3388FF';
+        }
+        const trimmed = input.trim();
+        const match = trimmed.match(/^#([0-9a-fA-F]{6})$/);
+        if (!match) {
+            return '#3388FF';
+        }
+        return `#${match[1].toUpperCase()}`;
+    };
+
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => {
+        switch (char) {
+            case '&':
+                return '&amp;';
+            case '<':
+                return '&lt;';
+            case '>':
+                return '&gt;';
+            case '"':
+                return '&quot;';
+            case "'":
+                return '&#39;';
+            default:
+                return char;
+        }
+    });
+
+    const renderCategoryBadges = (categories) => {
+        if (!Array.isArray(categories) || categories.length === 0) {
+            return '';
+        }
+        return categories.map((category) => {
+            const name = escapeHtml(category?.name ?? '');
+            const color = sanitizeColor(category?.color);
+            return `<span class="category-pill" style="--category-color: ${color}">${name}</span>`;
+        }).join(' ');
+    };
+
+    const detail = document.querySelector('[data-photo-detail]');
+    const detailEmpty = detail ? detail.querySelector('[data-photo-detail-empty]') : null;
+    const detailBody = detail ? detail.querySelector('[data-photo-detail-body]') : null;
+    const detailImage = detail ? detail.querySelector('[data-photo-detail-image]') : null;
+    const detailTitle = detail ? detail.querySelector('[data-photo-detail-title]') : null;
+    const detailIdInput = detail ? detail.querySelector('[data-photo-detail-id]') : null;
+    const detailTitleInput = detail ? detail.querySelector('[data-photo-detail-title-input]') : null;
+    const detailDescriptionInput = detail ? detail.querySelector('[data-photo-detail-description-input]') : null;
+    const detailLatitudeInput = detail ? detail.querySelector('[data-photo-detail-latitude]') : null;
+    const detailLongitudeInput = detail ? detail.querySelector('[data-photo-detail-longitude]') : null;
+    const detailTakenInput = detail ? detail.querySelector('[data-photo-detail-taken]') : null;
+    const detailDistance = detail ? detail.querySelector('[data-photo-detail-distance]') : null;
+    const detailCategoryInputs = detail ? Array.from(detail.querySelectorAll('[data-category-checkbox]')) : [];
+    const detailClose = detail ? detail.querySelector('[data-photo-detail-close]') : null;
+    const geocodeEndpoint = document.body?.dataset?.geocodeUrl || 'geocode.php';
+    let activeCard = null;
+    let suppressScroll = false;
+    let map = null;
+    let homeLatLng = null;
+    let homeMarker = null;
+    let homeLine = null;
+
+    const toRadians = (value) => (value * Math.PI) / 180;
+
+    const computeDistanceMeters = (lat1, lng1, lat2, lng2) => {
+        const earthRadius = 6371000;
+        const phi1 = toRadians(lat1);
+        const phi2 = toRadians(lat2);
+        const deltaPhi = toRadians(lat2 - lat1);
+        const deltaLambda = toRadians(lng2 - lng1);
+
+        const a = Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2)
+            + Math.cos(phi1) * Math.cos(phi2)
+            * Math.sin(deltaLambda / 2) * Math.sin(deltaLambda / 2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        return earthRadius * c;
+    };
+
+    const formatDistanceLabel = (meters) => {
+        if (!Number.isFinite(meters)) {
+            return null;
+        }
+        const kilometers = meters / 1000;
+        if (kilometers >= 100) {
+            return `${Math.round(kilometers)} km`;
+        }
+        if (kilometers >= 10) {
+            return `${kilometers.toFixed(1)} km`;
+        }
+        return `${kilometers.toFixed(2)} km`;
+    };
+
+    const setDistanceText = (label) => {
+        if (!detailDistance) {
+            return;
+        }
+        if (label) {
+            detailDistance.textContent = `Luftlinie von Zuhause: ${label}`;
+            detailDistance.classList.remove('hidden');
+        } else {
+            detailDistance.textContent = '';
+            detailDistance.classList.add('hidden');
+        }
+    };
+
+    const clearHomeLine = () => {
+        if (homeLine) {
+            homeLine.remove();
+            homeLine = null;
+        }
+    };
+
+    const updateHomeDistance = (photo) => {
+        if (!enableHomeDistance) {
+            setDistanceText('');
+            clearHomeLine();
+            return;
+        }
+
+        const lat = Number.parseFloat(photo?.latitude);
+        const lng = Number.parseFloat(photo?.longitude);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+            setDistanceText('');
+            clearHomeLine();
+            return;
+        }
+
+        const meters = computeDistanceMeters(rawHomeLatitude, rawHomeLongitude, lat, lng);
+        const label = formatDistanceLabel(meters);
+        setDistanceText(label);
+
+        if (!canDrawHomeLine || !map || !homeLatLng) {
+            return;
+        }
+
+        clearHomeLine();
+        const targetLatLng = L.latLng(lat, lng);
+        homeLine = L.polyline([homeLatLng, targetLatLng], {
+            color: '#0f172a',
+            weight: 2,
+            opacity: 0.75,
+            dashArray: '6 6',
+            interactive: false,
+        }).addTo(map);
+
+        if (label) {
+            homeLine.bindTooltip(label, {
+                permanent: true,
+                direction: 'center',
+                className: 'distance-tooltip',
+            });
+            const center = typeof homeLine.getCenter === 'function' ? homeLine.getCenter() : targetLatLng;
+            homeLine.openTooltip(center);
+        }
+    };
+
+    const highlightCard = (photoId) => {
+        if (activeCard) {
+            activeCard.classList.remove('active');
+            activeCard = null;
+        }
+        if (!Number.isFinite(photoId)) {
+            return;
+        }
+        const card = document.querySelector(`[data-photo-card][data-photo-id="${photoId}"]`);
+        if (card) {
+            card.classList.add('active');
+            activeCard = card;
+            if (!suppressScroll) {
+                card.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+            }
+        }
+    };
+
+    const formatCoordinate = (value) => {
+        const num = Number.parseFloat(value);
+        if (!Number.isFinite(num)) {
+            return null;
+        }
+        return num.toFixed(6);
+    };
+
+    const showDetail = (photo) => {
+        if (!detail || !photo) {
+            return;
+        }
+        if (detailEmpty) {
+            detailEmpty.classList.add('hidden');
+        }
+        if (detailBody) {
+            detailBody.classList.remove('hidden');
+        }
+        if (detailImage) {
+            const imageUrl = photo.original_image_url || photo.image_url;
+            detailImage.src = imageUrl;
+            detailImage.alt = photo.title || 'Ohne Titel';
+        }
+        if (detailTitle) {
+            detailTitle.textContent = photo.title || 'Ohne Titel';
+        }
+        if (detailIdInput) {
+            detailIdInput.value = photo.id;
+        }
+        if (detailTitleInput) {
+            detailTitleInput.value = photo.title || '';
+        }
+        if (detailDescriptionInput) {
+            detailDescriptionInput.value = photo.description || '';
+        }
+        if (detailLatitudeInput) {
+            const lat = parseFloat(photo.latitude);
+            detailLatitudeInput.value = Number.isFinite(lat) ? lat.toFixed(6) : '';
+        }
+        if (detailLongitudeInput) {
+            const lng = parseFloat(photo.longitude);
+            detailLongitudeInput.value = Number.isFinite(lng) ? lng.toFixed(6) : '';
+        }
+        if (detailTakenInput) {
+            if (photo.taken_at) {
+                const formatted = photo.taken_at.replace(' ', 'T').slice(0, 16);
+                detailTakenInput.value = formatted;
+            } else {
+                detailTakenInput.value = '';
+            }
+        }
+        if (detailCategoryInputs.length > 0) {
+            const selectedCategories = Array.isArray(photo.category_ids)
+                ? photo.category_ids.map((id) => Number(id))
+                : [];
+            detailCategoryInputs.forEach((input) => {
+                const value = Number(input.value);
+                input.checked = selectedCategories.includes(value);
+            });
+        }
+        updateHomeDistance(photo);
+        detail.classList.add('active');
+        highlightCard(Number(photo.id));
+    };
+
+    const setupGeocodeSearch = () => {
+        const blocks = Array.from(document.querySelectorAll('[data-geocode]'));
+        if (blocks.length === 0) {
+            return;
+        }
+
+        blocks.forEach((block) => {
+            const latId = block.getAttribute('data-lat-field');
+            const lngId = block.getAttribute('data-lng-field');
+            const latInput = latId ? document.getElementById(latId) : null;
+            const lngInput = lngId ? document.getElementById(lngId) : null;
+            const searchInput = block.querySelector('[data-geocode-input]');
+            const searchButton = block.querySelector('[data-geocode-button]');
+            const resultsList = block.querySelector('[data-geocode-results]');
+            const feedback = block.querySelector('[data-geocode-feedback]');
+
+            if (!searchInput || !searchButton || !resultsList || (!latInput && !lngInput)) {
+                return;
+            }
+
+            let activeController = null;
+
+            const setFeedback = (message, status = 'info') => {
+                if (!feedback) {
+                    return;
+                }
+                feedback.textContent = message || '';
+                feedback.classList.toggle('hidden', !message);
+                feedback.classList.remove('error', 'success');
+                if (status === 'error') {
+                    feedback.classList.add('error');
+                } else if (status === 'success') {
+                    feedback.classList.add('success');
+                }
+            };
+
+            const clearResults = () => {
+                while (resultsList.firstChild) {
+                    resultsList.removeChild(resultsList.firstChild);
+                }
+            };
+
+            const applyResult = (item) => {
+                const lat = formatCoordinate(item.lat ?? item.latitude);
+                const lng = formatCoordinate(item.lon ?? item.lng ?? item.longitude);
+                if (lat && latInput) {
+                    latInput.value = lat;
+                    latInput.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                if (lng && lngInput) {
+                    lngInput.value = lng;
+                    lngInput.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                setFeedback('Koordinaten übernommen.', 'success');
+                clearResults();
+            };
+
+            const handleSearch = async () => {
+                const query = searchInput.value.trim();
+                if (!query) {
+                    setFeedback('Bitte eine Adresse eingeben.', 'error');
+                    clearResults();
+                    return;
+                }
+
+                if (activeController) {
+                    activeController.abort();
+                }
+
+                activeController = new AbortController();
+                setFeedback('Suche läuft...');
+                clearResults();
+
+                try {
+                    const response = await fetch(`${geocodeEndpoint}?q=${encodeURIComponent(query)}`, {
+                        headers: {
+                            'Accept': 'application/json'
+                        },
+                        signal: activeController.signal
+                    });
+                    if (!response.ok) {
+                        throw new Error('Geocoding failed');
+                    }
+                    const payload = await response.json();
+                    const items = Array.isArray(payload?.results) ? payload.results : [];
+                    if (items.length === 0) {
+                        setFeedback('Keine Treffer gefunden.', 'error');
+                        return;
+                    }
+
+                    setFeedback('Treffer gefunden. Wähle einen Eintrag aus.');
+                    items.forEach((item) => {
+                        const displayName = item.display_name || `${item.lat}, ${item.lon}`;
+                        if (!displayName) {
+                            return;
+                        }
+                        const listItem = document.createElement('li');
+                        const button = document.createElement('button');
+                        button.type = 'button';
+                        button.textContent = displayName;
+                        button.addEventListener('click', () => {
+                            applyResult(item);
+                        });
+                        listItem.appendChild(button);
+                        resultsList.appendChild(listItem);
+                    });
+                } catch (error) {
+                    if (error.name === 'AbortError') {
+                        return;
+                    }
+                    setFeedback('Suche fehlgeschlagen. Bitte später erneut versuchen.', 'error');
+                    clearResults();
+                }
+            };
+
+            searchButton.addEventListener('click', (event) => {
+                event.preventDefault();
+                void handleSearch();
+            });
+
+            searchInput.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    void handleSearch();
+                }
+            });
+
+            searchInput.addEventListener('input', () => {
+                if (feedback && !feedback.classList.contains('hidden')) {
+                    setFeedback('');
+                }
+            });
+        });
+    };
+
+    const hideDetail = () => {
+        if (!detail) {
+            return;
+        }
+        if (detailBody) {
+            detailBody.classList.add('hidden');
+        }
+        if (detailEmpty) {
+            detailEmpty.classList.remove('hidden');
+        }
+        if (detailImage) {
+            detailImage.src = '';
+            detailImage.alt = '';
+        }
+        if (detailTitle) {
+            detailTitle.textContent = 'Details';
+        }
+        if (detailIdInput) {
+            detailIdInput.value = '';
+        }
+        if (detailTitleInput) {
+            detailTitleInput.value = '';
+        }
+        if (detailDescriptionInput) {
+            detailDescriptionInput.value = '';
+        }
+        if (detailLatitudeInput) {
+            detailLatitudeInput.value = '';
+        }
+        if (detailLongitudeInput) {
+            detailLongitudeInput.value = '';
+        }
+        if (detailTakenInput) {
+            detailTakenInput.value = '';
+        }
+        if (detailCategoryInputs.length > 0) {
+            detailCategoryInputs.forEach((input) => {
+                input.checked = false;
+            });
+        }
+        setDistanceText('');
+        clearHomeLine();
+        detail.classList.remove('active');
+        highlightCard(NaN);
+    };
+
+    if (detailClose) {
+        detailClose.addEventListener('click', () => {
+            hideDetail();
+        });
+    }
+
+    setupGeocodeSearch();
+
+    const categoryFilterInputs = Array.from(document.querySelectorAll('[data-category-filter]'));
+    const categoryResetButton = document.querySelector('[data-category-filter-reset]');
+    const hiddenCategoryIds = new Set();
+    let hideUncategorized = false;
+    const markerEntries = [];
+
+    const mapElement = document.getElementById('map');
+    const defaultView = { center: [20, 0], zoom: 2 };
+    let bounds = null;
+    let initialBounds = null;
+    let hasVisibleMarkers = false;
+
+    const computeVisibleBounds = () => {
+        if (!map || !hasLeaflet) {
+            return null;
+        }
+        const visibleMarkers = markerEntries
+            .filter((entry) => map.hasLayer(entry.marker))
+            .map((entry) => entry.marker);
+        if (homeMarker && map.hasLayer(homeMarker)) {
+            visibleMarkers.push(homeMarker);
+        }
+        if (visibleMarkers.length === 0) {
+            return null;
+        }
+        return L.featureGroup(visibleMarkers).getBounds().pad(0.3);
+    };
+
+    const applyCategoryFilters = () => {
+        if (!map) {
+            return;
+        }
+        markerEntries.forEach((entry) => {
+            const hasCategories = entry.categoryIds.length > 0;
+            const shouldHide = hasCategories
+                ? entry.categoryIds.some((id) => hiddenCategoryIds.has(id))
+                : hideUncategorized;
+            const isVisible = map.hasLayer(entry.marker);
+            if (shouldHide && isVisible) {
+                entry.marker.closePopup();
+                entry.marker.removeFrom(map);
+            } else if (!shouldHide && !isVisible) {
+                entry.marker.addTo(map);
+            }
+        });
+        hasVisibleMarkers = markerEntries.some((entry) => map.hasLayer(entry.marker));
+        const updatedBounds = computeVisibleBounds();
+        bounds = updatedBounds || initialBounds;
+    };
+
+    const syncFilterStateFromInput = (input) => {
+        if (!input) {
+            return;
+        }
+        const key = input.getAttribute('data-category-filter');
+        if (key === 'none') {
+            hideUncategorized = !input.checked;
+            return;
+        }
+        const categoryId = Number(key);
+        if (!Number.isFinite(categoryId)) {
+            return;
+        }
+        if (input.checked) {
+            hiddenCategoryIds.delete(categoryId);
+        } else {
+            hiddenCategoryIds.add(categoryId);
+        }
+    };
+
+    categoryFilterInputs.forEach((input) => {
+        input.addEventListener('change', () => {
+            syncFilterStateFromInput(input);
+            applyCategoryFilters();
+        });
+    });
+
+    if (categoryResetButton) {
+        categoryResetButton.addEventListener('click', () => {
+            hiddenCategoryIds.clear();
+            hideUncategorized = false;
+            categoryFilterInputs.forEach((input) => {
+                input.checked = true;
+            });
+            applyCategoryFilters();
+        });
+    }
+
+    if (mapElement && hasLeaflet) {
+        map = L.map(mapElement).setView(defaultView.center, defaultView.zoom);
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/">OpenStreetMap</a> Contributors',
+            maxZoom: 18,
+        }).addTo(map);
+
+        if (canDrawHomeLine) {
+            homeLatLng = L.latLng(rawHomeLatitude, rawHomeLongitude);
+            homeMarker = L.circleMarker(homeLatLng, {
+                radius: 7,
+                color: '#0f172a',
+                weight: 2,
+                fillColor: '#f59e0b',
+                fillOpacity: 1,
+                interactive: false,
+                className: 'home-marker',
+            }).addTo(map);
+            homeMarker.bindTooltip('Zuhause', {
+                permanent: true,
+                direction: 'right',
+                offset: [10, 0],
+                className: 'home-tooltip',
+            });
+        }
+
+        const photosWithCoordinates = allPhotos.filter(photo => {
+            const lat = parseFloat(photo.latitude);
+            const lng = parseFloat(photo.longitude);
+            return Number.isFinite(lat) && Number.isFinite(lng);
+        });
+
+        const markers = [];
+        photosWithCoordinates.forEach(photo => {
+            const lat = parseFloat(photo.latitude);
+            const lng = parseFloat(photo.longitude);
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+                return;
+            }
+            const markerColor = sanitizeColor(photo.primary_color || (photo.category_details && photo.category_details[0]?.color));
+            const marker = L.circleMarker([lat, lng], {
+                radius: 8,
+                color: markerColor,
+                fillColor: markerColor,
+                fillOpacity: 0.9,
+                weight: 2,
+            }).addTo(map);
+            const categories = Array.isArray(photo.category_details) && photo.category_details.length > 0
+                ? `<div class="popup-categories">${renderCategoryBadges(photo.category_details)}</div>`
+                : '';
+            const popupTitle = escapeHtml(photo.title || 'Ohne Titel');
+            const popupDescription = photo.description ? `<em>${escapeHtml(photo.description)}</em><br>` : '';
+            const popupTaken = photo.taken_at ? `<span class="popup-date">Aufgenommen am: ${escapeHtml(photo.taken_at)}</span><br>`
+                : '';
+            const imageUrl = typeof photo.image_url === 'string' ? escapeHtml(photo.image_url) : '';
+            const image = imageUrl
+                ? `<img src="${imageUrl}" alt="${popupTitle}" class="popup-image">`
+                : '';
+            const popupContent = `
+                <div class="popup">
+                    ${image}
+                    <strong>${popupTitle}</strong><br>
+                    ${popupDescription}
+                    ${categories}
+                    ${popupTaken}
+                </div>
+            `;
+            marker.bindPopup(popupContent);
+            marker.on('click', () => {
+                showDetail(photo);
+            });
+            markers.push(marker);
+            const categoryIds = Array.isArray(photo.category_ids)
+                ? photo.category_ids
+                    .map((id) => Number(id))
+                    .filter((value) => Number.isFinite(value))
+                : [];
+            markerEntries.push({
+                marker,
+                categoryIds,
+            });
+        });
+
+        const boundingLayers = homeMarker ? markers.concat(homeMarker) : markers;
+        if (boundingLayers.length > 0) {
+            const group = L.featureGroup(boundingLayers);
+            bounds = group.getBounds().pad(0.3);
+            map.fitBounds(bounds);
+            initialBounds = bounds;
+        }
+
+        const homeControl = L.control({ position: 'topleft' });
+        homeControl.onAdd = () => {
+            const container = L.DomUtil.create('div', 'leaflet-bar home-control');
+            const button = L.DomUtil.create('button', '', container);
+            button.type = 'button';
+            button.textContent = 'Home';
+            L.DomEvent.on(button, 'click', (event) => {
+                L.DomEvent.stop(event);
+                if (hasVisibleMarkers && bounds) {
+                    map.fitBounds(bounds);
+                } else if (initialBounds) {
+                    map.fitBounds(initialBounds);
+                } else {
+                    map.setView(defaultView.center, defaultView.zoom);
+                }
+            });
+            return container;
+        };
+        homeControl.addTo(map);
+
+        applyCategoryFilters();
+
+        setTimeout(() => {
+            map.invalidateSize();
+            if (hasVisibleMarkers && bounds) {
+                map.fitBounds(bounds);
+            } else if (initialBounds) {
+                map.fitBounds(initialBounds);
+            } else {
+                map.setView(defaultView.center, defaultView.zoom);
+            }
+        }, 200);
+    }
+
+    const openPhotoFromCard = (card) => {
+        if (!card) {
+            return;
+        }
+        const id = Number(card.getAttribute('data-photo-id'));
+        if (!Number.isFinite(id)) {
+            return;
+        }
+        const photo = photoIndex.get(id);
+        if (photo) {
+            if (window.GeoPhotothek && typeof window.GeoPhotothek.setActivePanel === 'function') {
+                window.GeoPhotothek.setActivePanel('dashboard');
+            }
+            suppressScroll = true;
+            showDetail(photo);
+            suppressScroll = false;
+        }
+    };
+
+    const ignoreSelector = '[data-ignore-card]';
+
+    document.querySelectorAll('[data-photo-trigger]').forEach(trigger => {
+        trigger.addEventListener('click', (event) => {
+            event.preventDefault();
+            const card = trigger.closest('[data-photo-card]');
+            openPhotoFromCard(card);
+        });
+    });
+
+    document.querySelectorAll('[data-photo-card]').forEach(card => {
+        card.addEventListener('click', (event) => {
+            if (event.target.closest('[data-photo-trigger]')) {
+                return;
+            }
+            if (event.target.closest('form')) {
+                return;
+            }
+            if (event.target.closest(ignoreSelector)) {
+                return;
+            }
+            openPhotoFromCard(card);
+        });
+        card.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                openPhotoFromCard(card);
+            }
+        });
+    });
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            hideDetail();
+        }
+    });
+
+    window.GeoPhotothek = window.GeoPhotothek || {};
+    window.GeoPhotothek.notifyPanelChange = (panel) => {
+        if (panel !== 'dashboard') {
+            return;
+        }
+        if (!map) {
+            return;
+        }
+        setTimeout(() => {
+            map.invalidateSize();
+            if (hasVisibleMarkers && bounds) {
+                map.fitBounds(bounds);
+            } else if (initialBounds) {
+                map.fitBounds(initialBounds);
+            } else {
+                map.setView(defaultView.center, defaultView.zoom);
+            }
+        }, 150);
+    };
+});
